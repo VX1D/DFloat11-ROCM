@@ -12,7 +12,7 @@ setup(
     author='Tianyi Zhang',
     packages=find_packages(),
     package_data={
-        "dfloat11": ['decode.ptx'],
+        "dfloat11": ['decode.ptx', 'decode.cu', 'decode_hip.cu'],
     },
     include_package_data=True,
     install_requires=[
