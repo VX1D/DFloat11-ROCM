@@ -29,7 +29,7 @@
 
 ## 📦 Installation
 
-Requires a CUDA-compatible GPU (with CUDA 12) and [PyTorch](https://pytorch.org/get-started/locally/) installed.
+Requires a CUDA-compatible GPU (with CUDA 12) or AMD GPU (with ROCm 7.2+) and [PyTorch](https://pytorch.org/get-started/locally/) installed.
 
 To install from PyPI:
 ```bash
@@ -41,6 +41,35 @@ pip install -U dfloat11[cuda12]
 nvcc -O3 -ptx dfloat11/decode.cu -o dfloat11/decode.ptx
 pip install .[cuda12]
 ```
+
+### AMD GPUs (ROCm)
+
+This fork adds ROCm support via HIPRTC (runtime kernel compilation). No pre-compiled binaries needed — the decode kernel compiles at runtime within PyTorch's HIP context.
+
+```bash
+pip install -U dfloat11
+```
+
+Requires ROCm 7.2+ with the PyTorch ROCm build. See [ROCm.md](ROCm.md) for setup details.
+
+#### ROCm Benchmarks (RX 7800 XT, gfx1101)
+
+NLLB-1.3B, eng→pol translation, beam=4, 99 sentences. **0/99 output diffs** (lossless).
+
+| Batch size | BF16 (ms/sent) | DF11 (ms/sent) | Overhead |
+|------------|----------------|----------------|----------|
+| 1          | 464            | 602            | +30%     |
+| 4          | 174            | 214            | +23%     |
+| 8          | 123            | 149            | +21%     |
+
+Peak VRAM: BF16 4473 MB, DF11 3811 MB (**-662 MB / -15%**)
+
+Overhead drops with batch size (decode cost is constant, amortized over more tokens). DF11 uses less VRAM because weights stay compressed.
+
+ROCm-specific optimizations over upstream CUDA kernel:
+- LUT preloaded into LDS (shared memory) — 1.52x faster decode vs global memory reads
+- Compiled code object cached to disk — no recompilation on subsequent runs
+- GPU architecture auto-detected from PyTorch (`gcnArchName`)
 
 ## 🔍 How It Works
 
@@ -166,11 +195,15 @@ Check [examples/compress_flux1](https://github.com/LeanModels/DFloat11/tree/mast
 
 📂 Official Code Repository: [https://github.com/LeanModels/DFloat11](https://github.com/LeanModels/DFloat11)
 
+📚 ROCm Documentation: [ROCm.md](ROCm.md) (AMD GPU support, troubleshooting, performance tuning)
+
 ## 🧠 Contributions
 
 This work is brought to you by the team at Rice University and [xMAD.ai](https://xmad.ai/).
 
 The GPU kernel was designed and implemented by [Tianyi Zhang](https://github.com/tonyzhang617).
+
+AMD ROCm kernel port and HIPRTC backend by [x264.webrip](https://github.com/VX1D/DFloat11-ROCM).
 
 ## 📚 Citation
 

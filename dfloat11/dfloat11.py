@@ -16,7 +16,6 @@ import math
 import os
 import re
 import json
-import pkg_resources
 from sys import stderr
 from typing import Optional, Dict, Union
 from tqdm import tqdm
@@ -24,7 +23,6 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 
-import cupy as cp
 import numpy as np
 
 from accelerate import infer_auto_device_map, dispatch_model
@@ -34,10 +32,27 @@ from safetensors.torch import load_file, save_file
 
 from .dfloat11_utils import get_codec, get_32bit_codec, get_luts, encode_weights
 
+# Backend detection: HIP/HIPRTC on ROCm, CuPy on CUDA
+_USE_HIP_BACKEND = (
+    os.environ.get("DFLOAT11_BACKEND", "").lower() == "rocm"
+    or (hasattr(torch.version, "hip") and torch.version.hip is not None)
+)
 
-# Load CUDA kernel for custom DFloat11 tensor decoding
-ptx_path = pkg_resources.resource_filename("dfloat11", "decode.ptx")
-_decode = cp.RawModule(path=ptx_path).get_function('decode')
+if _USE_HIP_BACKEND:
+    from .hip_backend import launch_decode as _hip_launch_decode
+    print("DFloat11 backend: HIP/HIPRTC", file=stderr)
+else:
+    import cupy as cp
+    try:
+        from importlib.resources import files as importlib_files
+        def _get_resource_path(filename):
+            return str(importlib_files("dfloat11").joinpath(filename))
+    except ImportError:
+        import pkg_resources
+        def _get_resource_path(filename):
+            return pkg_resources.resource_filename("dfloat11", filename)
+    _decode = cp.RawModule(path=_get_resource_path("decode.ptx")).get_function('decode')
+    print("DFloat11 backend: CUDA/CuPy", file=stderr)
 
 
 # Define constants
@@ -138,17 +153,27 @@ def get_hook(threads_per_block, bytes_per_thread):
         # Configure CUDA grid dimensions for the kernel launch
         blocks_per_grid = (int(math.ceil(n_bytes / (threads_per_block[0] * bytes_per_thread))), )
 
-        # Launch CUDA kernel to decode the compressed weights
-        with cp.cuda.Device(device.index):
-            _decode(grid=blocks_per_grid, block=threads_per_block, shared_mem=module.shared_mem_size, args=[
-                module.luts.data_ptr(),
-                module.encoded_exponent.data_ptr(),
-                module.sign_mantissa.data_ptr(),
-                module.output_positions.data_ptr(),
-                module.gaps.data_ptr(),
-                reconstructed.data_ptr(),
-                n_luts, n_bytes, n_elements
-            ])
+        # Launch decode kernel
+        if _USE_HIP_BACKEND:
+            _hip_launch_decode(
+                module.luts, module.encoded_exponent, module.sign_mantissa,
+                module.output_positions, module.gaps, reconstructed,
+                n_luts, n_bytes, n_elements,
+                threads_per_block=threads_per_block[0],
+                bytes_per_thread=bytes_per_thread,
+                shared_mem_size=module.shared_mem_size,
+            )
+        else:
+            with cp.cuda.Device(device.index):
+                _decode(grid=blocks_per_grid, block=threads_per_block, shared_mem=module.shared_mem_size, args=[
+                    module.luts.data_ptr(),
+                    module.encoded_exponent.data_ptr(),
+                    module.sign_mantissa.data_ptr(),
+                    module.output_positions.data_ptr(),
+                    module.gaps.data_ptr(),
+                    reconstructed.data_ptr(),
+                    n_luts, n_bytes, n_elements
+                ])
 
         # Inject reconstructed weights into the appropriate module
         if isinstance(module, nn.Linear):
@@ -573,16 +598,26 @@ def compress_model(
                     shared_mem_size = threads_per_block[0] * 4 + 4 + (output_positions_np[1:] - output_positions_np[:-1]).max().item() * 2
                     print(f'Using {shared_mem_size} bytes of shared memory.')
 
-                    with cp.cuda.Device(device.index):
-                        _decode(grid=blocks_per_grid, block=threads_per_block, shared_mem=shared_mem_size, args=[
-                            cuda_luts.data_ptr(),
-                            cuda_encoded.data_ptr(),
-                            cuda_other_8bits.data_ptr(),
-                            cuda_output_positions.data_ptr(),
-                            cuda_gaps.data_ptr(),
-                            cuda_outputs.data_ptr(),
-                            n_luts, n_bytes, n_elements
-                        ])
+                    if _USE_HIP_BACKEND:
+                        _hip_launch_decode(
+                            cuda_luts, cuda_encoded, cuda_other_8bits,
+                            cuda_output_positions, cuda_gaps, cuda_outputs,
+                            n_luts, n_bytes, n_elements,
+                            threads_per_block=threads_per_block[0],
+                            bytes_per_thread=bytes_per_thread,
+                            shared_mem_size=shared_mem_size,
+                        )
+                    else:
+                        with cp.cuda.Device(device.index):
+                            _decode(grid=blocks_per_grid, block=threads_per_block, shared_mem=shared_mem_size, args=[
+                                cuda_luts.data_ptr(),
+                                cuda_encoded.data_ptr(),
+                                cuda_other_8bits.data_ptr(),
+                                cuda_output_positions.data_ptr(),
+                                cuda_gaps.data_ptr(),
+                                cuda_outputs.data_ptr(),
+                                n_luts, n_bytes, n_elements
+                            ])
 
                     _is_correct = (torch.cat(weights) == cuda_outputs.cpu()).all().item()
                     if _is_correct:
