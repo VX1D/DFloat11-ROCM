@@ -5,6 +5,10 @@ import math
 import os
 from sys import stderr
 
+# Enable ROCm experimental features before importing torch
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+os.environ.setdefault("PYTORCH_TUNABLEOP_ENABLED", "1")
+
 import torch
 
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
